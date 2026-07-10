@@ -347,9 +347,17 @@ def _adopt_existing_tab(session: Dict[str, Any]) -> Dict[str, Any]:
     tab_id = latest.get("tabId") if isinstance(latest, dict) else None
     if isinstance(tab_id, str) and tab_id:
         session["tab_id"] = tab_id
+        session["active_tab_id"] = tab_id
+        if tab_id not in session.get("tabs", []):
+            session.setdefault("tabs", []).append(tab_id)
         logger.debug("Adopted existing Camofox tab %s for %s", tab_id, session.get("user_id"))
 
     return session
+
+
+def _current_tab_id(session):
+    """Return the active tab id, falling back to the primary tab id."""
+    return session.get("active_tab_id") or session.get("tab_id")
 
 
 def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
@@ -370,6 +378,8 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
             session = {
                 "user_id": identity_override["user_id"],
                 "tab_id": None,
+                "active_tab_id": None,
+                "tabs": [],
                 "session_key": identity_override["session_key"],
                 "managed": True,
                 "adopt_existing_tab": _adopt_existing_tab_enabled(camofox_cfg),
@@ -379,6 +389,8 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
             session = {
                 "user_id": identity["user_id"],
                 "tab_id": None,
+                "active_tab_id": None,
+                "tabs": [],
                 "session_key": identity["session_key"],
                 "managed": True,
                 "adopt_existing_tab": _adopt_existing_tab_enabled(camofox_cfg),
@@ -387,6 +399,8 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
             session = {
                 "user_id": f"hermes_{uuid.uuid4().hex[:10]}",
                 "tab_id": None,
+                "active_tab_id": None,
+                "tabs": [],
                 "session_key": f"task_{task_id[:16]}",
                 "managed": False,
                 "adopt_existing_tab": False,
@@ -414,6 +428,9 @@ def _ensure_tab(task_id: Optional[str], url: str = "about:blank") -> Dict[str, A
     resp.raise_for_status()
     data = resp.json()
     session["tab_id"] = data.get("tabId")
+    session["active_tab_id"] = session["tab_id"]
+    if session["tab_id"] and session["tab_id"] not in session.setdefault("tabs", []):
+        session["tabs"].append(session["tab_id"])
     return session
 
 
@@ -494,7 +511,7 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
     try:
         browser_url, rewrite_info = _rewrite_loopback_url_for_camofox(url)
         session = _get_session(task_id)
-        if not session["tab_id"]:
+        if not _current_tab_id(session):
             # Create tab with the target URL directly
             session = _ensure_tab(task_id, browser_url)
             data = {"ok": True, "url": browser_url}
@@ -502,7 +519,7 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
             # Navigate existing tab — recover from stale tab 404
             try:
                 data = _post(
-                    f"/tabs/{session['tab_id']}/navigate",
+                    f"/tabs/{_current_tab_id(session)}/navigate",
                     {"userId": session["user_id"], "url": browser_url},
                     timeout=60,
                 )
@@ -541,7 +558,7 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
         # Auto-take a compact snapshot so the model can act immediately
         try:
             snap_data = _get(
-                f"/tabs/{session['tab_id']}/snapshot",
+                f"/tabs/{_current_tab_id(session)}/snapshot",
                 params={"userId": session["user_id"]},
             )
             snapshot_text = snap_data.get("snapshot", "")
@@ -591,7 +608,7 @@ def _camofox_private_page_block(session: Dict[str, Any], task_id: Optional[str],
 
     if not _eval_ssrf_guard_active(task_id or "default"):
         return None
-    blocked_url = _camofox_current_page_private_url(session["tab_id"], session["user_id"])
+    blocked_url = _camofox_current_page_private_url(_current_tab_id(session) or "", session["user_id"])
     if not blocked_url:
         return None
     return json.dumps({
@@ -609,7 +626,7 @@ def camofox_snapshot(full: bool = False, task_id: Optional[str] = None,
     """Get accessibility tree snapshot from Camofox."""
     try:
         session = _get_session(task_id)
-        if not session["tab_id"]:
+        if not _current_tab_id(session):
             return tool_error("No browser session. Call browser_navigate first.", success=False)
 
         blocked = _camofox_private_page_block(session, task_id, "read a page snapshot")
@@ -617,7 +634,7 @@ def camofox_snapshot(full: bool = False, task_id: Optional[str] = None,
             return blocked
 
         data = _get(
-            f"/tabs/{session['tab_id']}/snapshot",
+            f"/tabs/{_current_tab_id(session)}/snapshot",
             params={"userId": session["user_id"]},
         )
 
@@ -650,7 +667,7 @@ def camofox_click(ref: str, task_id: Optional[str] = None) -> str:
     """Click an element by ref via Camofox."""
     try:
         session = _get_session(task_id)
-        if not session["tab_id"]:
+        if not _current_tab_id(session):
             return tool_error("No browser session. Call browser_navigate first.", success=False)
 
         blocked = _camofox_private_page_block(session, task_id, "click")
@@ -661,7 +678,7 @@ def camofox_click(ref: str, task_id: Optional[str] = None) -> str:
         clean_ref = ref.lstrip("@")
 
         data = _post(
-            f"/tabs/{session['tab_id']}/click",
+            f"/tabs/{_current_tab_id(session)}/click",
             {"userId": session["user_id"], "ref": clean_ref},
         )
         return json.dumps({
@@ -677,7 +694,7 @@ def camofox_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
     """Type text into an element by ref via Camofox."""
     try:
         session = _get_session(task_id)
-        if not session["tab_id"]:
+        if not _current_tab_id(session):
             return tool_error("No browser session. Call browser_navigate first.", success=False)
 
         blocked = _camofox_private_page_block(session, task_id, "type")
@@ -687,7 +704,7 @@ def camofox_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
         clean_ref = ref.lstrip("@")
 
         _post(
-            f"/tabs/{session['tab_id']}/type",
+            f"/tabs/{_current_tab_id(session)}/type",
             {"userId": session["user_id"], "ref": clean_ref, "text": text},
         )
         from agent.display import (
@@ -718,11 +735,11 @@ def camofox_scroll(direction: str, task_id: Optional[str] = None) -> str:
     """Scroll the page via Camofox."""
     try:
         session = _get_session(task_id)
-        if not session["tab_id"]:
+        if not _current_tab_id(session):
             return tool_error("No browser session. Call browser_navigate first.", success=False)
 
         _post(
-            f"/tabs/{session['tab_id']}/scroll",
+            f"/tabs/{_current_tab_id(session)}/scroll",
             {"userId": session["user_id"], "direction": direction},
         )
         return json.dumps({"success": True, "scrolled": direction})
@@ -734,11 +751,11 @@ def camofox_back(task_id: Optional[str] = None) -> str:
     """Navigate back via Camofox."""
     try:
         session = _get_session(task_id)
-        if not session["tab_id"]:
+        if not _current_tab_id(session):
             return tool_error("No browser session. Call browser_navigate first.", success=False)
 
         data = _post(
-            f"/tabs/{session['tab_id']}/back",
+            f"/tabs/{_current_tab_id(session)}/back",
             {"userId": session["user_id"]},
         )
         return json.dumps({"success": True, "url": data.get("url", "")})
@@ -750,7 +767,7 @@ def camofox_press(key: str, task_id: Optional[str] = None) -> str:
     """Press a keyboard key via Camofox."""
     try:
         session = _get_session(task_id)
-        if not session["tab_id"]:
+        if not _current_tab_id(session):
             return tool_error("No browser session. Call browser_navigate first.", success=False)
 
         blocked = _camofox_private_page_block(session, task_id, "press")
@@ -758,7 +775,7 @@ def camofox_press(key: str, task_id: Optional[str] = None) -> str:
             return blocked
 
         _post(
-            f"/tabs/{session['tab_id']}/press",
+            f"/tabs/{_current_tab_id(session)}/press",
             {"userId": session["user_id"], "key": key},
         )
         return json.dumps({"success": True, "pressed": key})
@@ -789,7 +806,7 @@ def camofox_get_images(task_id: Optional[str] = None) -> str:
     """
     try:
         session = _get_session(task_id)
-        if not session["tab_id"]:
+        if not _current_tab_id(session):
             return tool_error("No browser session. Call browser_navigate first.", success=False)
 
         blocked = _camofox_private_page_block(session, task_id, "extract page images")
@@ -799,7 +816,7 @@ def camofox_get_images(task_id: Optional[str] = None) -> str:
         import re
 
         data = _get(
-            f"/tabs/{session['tab_id']}/snapshot",
+            f"/tabs/{_current_tab_id(session)}/snapshot",
             params={"userId": session["user_id"]},
         )
         snapshot = data.get("snapshot", "")
@@ -837,7 +854,7 @@ def camofox_vision(question: str, annotate: bool = False,
     """Take a screenshot and analyze it with vision AI via Camofox."""
     try:
         session = _get_session(task_id)
-        if not session["tab_id"]:
+        if not _current_tab_id(session):
             return tool_error("No browser session. Call browser_navigate first.", success=False)
 
         blocked = _camofox_private_page_block(session, task_id, "capture a screenshot")
@@ -846,7 +863,7 @@ def camofox_vision(question: str, annotate: bool = False,
 
         # Get screenshot as binary PNG
         resp = _get_raw(
-            f"/tabs/{session['tab_id']}/screenshot",
+            f"/tabs/{_current_tab_id(session)}/screenshot",
             params={"userId": session["user_id"]},
         )
 
@@ -867,7 +884,7 @@ def camofox_vision(question: str, annotate: bool = False,
         if annotate:
             try:
                 snap_data = _get(
-                    f"/tabs/{session['tab_id']}/snapshot",
+                    f"/tabs/{_current_tab_id(session)}/snapshot",
                     params={"userId": session["user_id"]},
                 )
                 annotation_context = f"\n\nAccessibility tree (element refs for interaction):\n{snap_data.get('snapshot', '')[:3000]}"
@@ -945,5 +962,175 @@ def camofox_console(clear: bool = False, task_id: Optional[str] = None) -> str:
                 "Use browser_snapshot or browser_vision to inspect page state.",
     })
 
+# ---------------------------------------------------------------------------
+# Multi-tab management
+# ---------------------------------------------------------------------------
 
 
+def _extend_session_for_multitab(task_id):
+    """Ensure an existing session has active_tab_id and tabs fields."""
+    session = _get_session(task_id)
+    if "active_tab_id" not in session:
+        session["active_tab_id"] = session.get("tab_id")
+    if "tabs" not in session:
+        tab_id = session.get("tab_id")
+        session["tabs"] = [tab_id] if tab_id else []
+    return session
+
+
+def camofox_new_tab(url, task_id=None):
+    """Create a new browser tab and navigate to a URL.
+
+    Creates a new independent Playwright page (tab) in the same browser
+    context. The new tab becomes the active tab for subsequent browser
+    tools until camofox_switch_tab is called.
+
+    Args:
+        url: URL to navigate to in the new tab
+        task_id: Task identifier for session isolation
+
+    Returns:
+        JSON string with the new tab_id and navigation result
+    """
+    try:
+        session = _get_session(task_id)
+        base_url = get_camofox_url()
+        resp = requests.post(
+            f"{base_url}/tabs/open",
+            json={
+                "userId": session["user_id"],
+                "url": url,
+            },
+            timeout=_get_command_timeout(),
+            headers=_auth_headers(),
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        tab_id = data.get("tabId")
+        if not tab_id:
+            return tool_error("No tabId in response", success=False)
+
+        # Register the new tab in session tracking
+        if tab_id not in session.setdefault("tabs", []):
+            session["tabs"].append(tab_id)
+        session["active_tab_id"] = tab_id
+
+        result = {
+            "success": True,
+            "tab_id": tab_id,
+            "url": data.get("url", url),
+            "title": data.get("title", ""),
+        }
+        return json.dumps(result)
+    except requests.HTTPError as e:
+        return tool_error(f"Failed to create new tab: {e}", success=False)
+    except requests.ConnectionError:
+        return json.dumps({
+            "success": False,
+            "error": f"Cannot connect to browser adapter at {get_camofox_url()}",
+        })
+    except Exception as e:
+        return tool_error(str(e), success=False)
+
+
+def camofox_switch_tab(tab_id, task_id=None):
+    """Switch the active tab to an existing tab by ID.
+
+    All subsequent browser tools (navigate, click, type, etc.) will operate
+    on this tab. Use camofox_list_tabs to see available tab IDs.
+
+    Args:
+        tab_id: The tab identifier to switch to
+        task_id: Task identifier for session isolation
+
+    Returns:
+        JSON string confirming the switch
+    """
+    try:
+        session = _get_session(task_id)
+        session["active_tab_id"] = tab_id
+        logger.debug("Switched to tab %s for session %s", tab_id, session.get("user_id"))
+        return json.dumps({"success": True, "active_tab_id": tab_id})
+    except Exception as e:
+        return tool_error(str(e), success=False)
+
+
+def camofox_list_tabs(task_id=None):
+    """List all open browser tabs.
+
+    Returns each tab's ID. Use the returned tab_id with
+    camofox_switch_tab to switch between tabs.
+
+    Args:
+        task_id: Task identifier for session isolation
+
+    Returns:
+        JSON string with list of tab IDs and the active tab
+    """
+    try:
+        session = _extend_session_for_multitab(task_id)
+        tabs = session.get("tabs", [])
+        active = _current_tab_id(session)
+        return json.dumps({
+            "success": True,
+            "tabs": tabs,
+            "active_tab_id": active,
+            "count": len(tabs),
+        })
+    except Exception as e:
+        return tool_error(str(e), success=False)
+
+
+def camofox_close_tab(tab_id, task_id=None):
+    """Close a specific browser tab.
+
+    If the closed tab was the active tab, the first remaining tab becomes
+    active. If no tabs remain, the session's tab_id is reset to None.
+
+    Args:
+        tab_id: The tab identifier to close
+        task_id: Task identifier for session isolation
+
+    Returns:
+        JSON string confirming the close
+    """
+    try:
+        session = _get_session(task_id)
+        base_url = get_camofox_url()
+        try:
+            resp = requests.delete(
+                f"{base_url}/tabs/{tab_id}",
+                headers=_auth_headers(),
+                timeout=_get_command_timeout(),
+            )
+            resp.raise_for_status()
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                logger.warning("Tab %s already closed on adapter, cleaning local state", tab_id)
+            else:
+                raise
+
+        # Clean local tracking
+        tabs = session.get("tabs", [])
+        if tab_id in tabs:
+            tabs.remove(tab_id)
+
+        # If closed tab was the active tab, fallback to first remaining
+        if session.get("active_tab_id") == tab_id:
+            session["active_tab_id"] = tabs[0] if tabs else None
+
+        # If closed tab was the primary tab_id, fallback
+        if session.get("tab_id") == tab_id:
+            session["tab_id"] = tabs[0] if tabs else None
+
+        logger.debug("Closed tab %s (%d tabs remain)", tab_id, len(tabs))
+        return json.dumps({
+            "success": True,
+            "closed_tab_id": tab_id,
+            "tabs_remaining": len(tabs),
+            "active_tab_id": session.get("active_tab_id"),
+        })
+    except requests.HTTPError as e:
+        return tool_error(f"Failed to close tab: {e}", success=False)
+    except Exception as e:
+        return tool_error(str(e), success=False)
