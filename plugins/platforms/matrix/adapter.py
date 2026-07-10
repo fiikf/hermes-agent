@@ -210,7 +210,7 @@ class _MatrixHtmlSanitizer(HTMLParser):
     _ALLOWED_TAGS = {
         "a", "b", "blockquote", "br", "code", "del", "em", "h1", "h2", "h3",
         "h4", "h5", "h6", "hr", "i", "li", "ol", "p", "pre", "s", "strike",
-        "strong", "table", "tbody", "td", "th", "thead", "tr", "ul",
+        "strong", "table", "tbody", "td", "tfoot", "th", "thead", "tr", "ul",
     }
     _VOID_TAGS = {"br", "hr"}
 
@@ -1429,6 +1429,41 @@ class MatrixAdapter(BasePlatformAdapter):
                                     )
 
                     client.crypto = olm
+                    # Patch DecryptionDispatcher to request keys on SessionNotFound
+                    from mautrix.client.encryption_manager import DecryptionDispatcher
+                    from mautrix.errors import SessionNotFound
+                    from mautrix.util import background_task as _bg
+
+                    _orig_handle = DecryptionDispatcher.handle
+
+                    async def _patched_handle(self_dd, evt):
+                        try:
+                            self_dd.client.crypto_log.trace(
+                                f"Decrypting {evt.event_id} in {evt.room_id}..."
+                            )
+                            decrypted = await self_dd.client.crypto.decrypt_megolm_event(evt)
+                        except SessionNotFound as _e:
+                            self_dd.client.crypto_log.warning(
+                                f"Failed to decrypt {evt.event_id}: {_e} — requesting keys"
+                            )
+                            _bg.create(
+                                self_dd.client.crypto.request_room_key(
+                                    evt.room_id,
+                                    evt.content.sender_key,
+                                    evt.content.session_id,
+                                    from_devices={evt.sender: [evt.content.device_id]},
+                                )
+                            )
+                            return
+                        except Exception as _e:
+                            self_dd.client.crypto_log.warning(
+                                f"Failed to decrypt {evt.event_id}: {_e}"
+                            )
+                            return
+                        self_dd.client.crypto_log.trace(f"Decrypted {evt.event_id}: {decrypted}")
+                        self_dd.client.dispatch_event(decrypted, evt.source)
+
+                    DecryptionDispatcher.handle = _patched_handle
                     logger.info(
                         "Matrix: E2EE enabled (store: %s%s)",
                         str(_CRYPTO_DB_PATH),
