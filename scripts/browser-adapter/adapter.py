@@ -1153,11 +1153,25 @@ def open_tab():
         return jsonify({"error": f"Browser deadlock, reinit in progress: {e}"}), 503
     _pages[tab_id] = page
     _touch_tab(tab_id)
+    # Register in tab_registry for session cleanup
+    user_id = data.get("userId", "")
+    if user_id:
+        if user_id not in _tab_registry:
+            _tab_registry[user_id] = {
+                "tabIds": [],
+                "sessionKey": data.get("sessionKey", ""),
+            }
+        _tab_registry[user_id]["tabIds"].append(tab_id)
     try:
         result = _pw_call(lambda: _pw_goto(url, page=page), timeout=30)
     except Exception as e:
         log.warning("open_tab: _pw_goto failed (%s), cleaning up tab", e)
         _pages.pop(tab_id, None)
+        # Clean up registry if we added to it
+        if user_id and user_id in _tab_registry:
+            _tab_registry[user_id]["tabIds"] = [t for t in _tab_registry[user_id]["tabIds"] if t != tab_id]
+            if not _tab_registry[user_id]["tabIds"]:
+                _tab_registry.pop(user_id, None)
         return jsonify({"error": f"Navigation failed after reinit: {e}"}), 503
     if "error" in result:
         return jsonify(result), 500
@@ -1187,6 +1201,14 @@ def close_tab(tab_id):
     else:
         _pw_call(lambda: _pw_goto("about:blank", page=page), timeout=10)
         _clear_last_url()
+    # Remove from tab_registry if present
+    for _cu_user_id, _cu_entry in list(_tab_registry.items()):
+        _cu_tab_ids = _cu_entry.get("tabIds", [])
+        if tab_id in _cu_tab_ids:
+            _cu_tab_ids.remove(tab_id)
+            if not _cu_tab_ids:
+                _tab_registry.pop(_cu_user_id, None)
+            break
     return jsonify({"ok": True})
 
 
@@ -1231,12 +1253,14 @@ def create_tab():
         result["vnc_hint"] = f"[{reason}] VNC ready for manual solving. Type '好了' when done."
     user_id = data.get("userId", "")
     if user_id:
-        _tab_registry[user_id] = {
-            "tabId": tab_id,
-            "sessionKey": data.get("sessionKey", ""),
-            "url": url,
-            "title": result.get("title", ""),
-        }
+        if user_id not in _tab_registry:
+            _tab_registry[user_id] = {
+                "tabIds": [],
+                "sessionKey": data.get("sessionKey", ""),
+                "url": url,
+                "title": result.get("title", ""),
+            }
+        _tab_registry[user_id]["tabIds"].append(tab_id)
     return jsonify(result)
 
 
@@ -1374,19 +1398,20 @@ def get_console(tab_id):
 
 @app.route("/sessions/<user_id>", methods=["DELETE"])
 def close_session(user_id):
-    # Close all pages for this user
+    # Close ALL pages for this user
     entry = _tab_registry.get(user_id)
     if entry:
-        tid = entry.get("tabId")
-        if tid and tid in _pages:
-            page = _pages.pop(tid, None)
-            if page:
-                try:
-                    asyncio.run_coroutine_threadsafe(page.close(), _pw_loop).result(timeout=10)
-                except Exception:
-                    pass
-            _page_consoles.pop(tid, None)
-            _page_nav.pop(tid, None)
+        tab_ids = list(entry.get("tabIds", []))
+        for tid in tab_ids:
+            if tid and tid in _pages:
+                page = _pages.pop(tid, None)
+                if page:
+                    try:
+                        asyncio.run_coroutine_threadsafe(page.close(), _pw_loop).result(timeout=10)
+                    except Exception:
+                        pass
+                _page_consoles.pop(tid, None)
+                _page_nav.pop(tid, None)
         _tab_registry.pop(user_id, None)
     # Also blank the main page
     _pw_call(lambda: _pw_close(), timeout=10)
