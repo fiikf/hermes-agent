@@ -11687,6 +11687,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Collapse long reasoning to keep messages readable
                     lines = last_reasoning.strip().splitlines()
                     if len(lines) > 15:
+                        # Balance unclosed code fences from truncated reasoning
+                        fence_count = sum(1 for l in lines[:15] if l.strip().startswith("```"))
+                        if fence_count % 2 == 1:
+                            display_reasoning += "\n```"
                         display_reasoning = "\n".join(lines[:15])
                         display_reasoning += f"\n_... ({len(lines) - 15} more lines)_"
                     else:
