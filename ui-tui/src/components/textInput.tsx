@@ -991,9 +991,9 @@ export function TextInput({
         flushKeyBurst()
 
         const sequence = (event.keypress as { sequence?: string }).sequence
-        const preserveBareLineFeed = shouldPreserveCtrlJNewline() && sequence === '\n'
+        const bareLineFeed = sequence === '\n'
 
-        if (k.shift || k.ctrl || preserveBareLineFeed || (isMac ? isActionMod(k) : k.meta)) {
+        if (k.shift || k.ctrl || bareLineFeed || (isMac ? isActionMod(k) : k.meta)) {
           commit(ins(vRef.current, curRef.current, '\n'), curRef.current + 1)
         } else {
           cbSubmit.current?.(vRef.current)
